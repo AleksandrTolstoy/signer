@@ -5,21 +5,11 @@ import (
 	"sort"
 	"strconv"
 	"sync"
-	"sync/atomic"
 )
 
-var (
-	totalSingleHashes uint32 = 0
-	totalMultiHashes  uint32 = 0
-	workerCount       uint32 = 7 // len(inputData)
-	thCount                  = 6
-)
+const workerCount = 7
 
-func inc(counter *uint32) {
-	atomic.AddUint32(counter, 1)
-}
-
-func Md5(data string, out chan string, m *sync.Mutex) {
+func Md5(data string, out chan string, m sync.Locker) {
 	m.Lock()
 	out <- DataSignerMd5(data)
 	m.Unlock()
@@ -29,31 +19,20 @@ func Crc32(data string, out chan string) {
 	out <- DataSignerCrc32(data)
 }
 
-type indexedCrc32 struct {
-	index int
-	value string
-}
-
-func Crc32WithIndexing(th int, data string, out chan *indexedCrc32, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	indexedCrc32 := &indexedCrc32{
-		index: th,
-		value: DataSignerCrc32(strconv.Itoa(th) + data),
-	}
-	out <- indexedCrc32
-}
-
 func SingleHash(in, out chan interface{}) {
-	m := &sync.Mutex{}
+	m := new(sync.Mutex)
+	wg := new(sync.WaitGroup)
 
-	for i := 0; i < int(workerCount); i++ {
-		go func() {
-			data := strconv.Itoa((<-in).(int))
+	for inputData := range in {
+		wg.Add(1)
+		go func(inputData int) {
+			defer wg.Done()
 
-			resAChan := make(chan string)
-			resBChan := make(chan string)
-			resCChan := make(chan string)
+			data := strconv.Itoa(inputData)
+
+			resAChan := make(chan string, 1)
+			resBChan := make(chan string, 1)
+			resCChan := make(chan string, 1)
 
 			go Crc32(data, resAChan)
 			go Md5(data, resBChan, m)
@@ -62,67 +41,69 @@ func SingleHash(in, out chan interface{}) {
 			result := <-resAChan + "~" + <-resCChan
 			fmt.Printf("%s SingleHash result: %s\n", data, result)
 			out <- result
-			if inc(&totalSingleHashes); totalSingleHashes == workerCount {
-				close(out)
-			}
-		}()
+		}(inputData.(int))
 	}
+	wg.Wait()
 }
 
 func MultiHash(in, out chan interface{}) {
+	thCount := 6
+	wg := new(sync.WaitGroup)
+
 	for singleHash := range in {
+		wg.Add(1)
 		go func(singleHash string) {
-			hashChan := make(chan *indexedCrc32, thCount)
-			wg := &sync.WaitGroup{}
+			defer wg.Done()
+
+			hashParts := make(map[int]chan string)
+			for th := 0; th < thCount; th++ {
+				hashChan := make(chan string, 1)
+				hashParts[th] = hashChan
+				go Crc32(strconv.Itoa(th)+singleHash, hashChan)
+			}
+
+			result := ""
 			for i := 0; i < thCount; i++ {
-				wg.Add(1)
-				go Crc32WithIndexing(i, singleHash, hashChan, wg)
+				result += <-hashParts[i]
 			}
-			wg.Wait()
-			close(hashChan)
-
-			hashParts := make(map[int]string)
-			for hashPart := range hashChan {
-				hashParts[hashPart.index] = hashPart.value
-			}
-
-			var result string
-			for i := 0; i < thCount; i++ {
-				result += hashParts[i]
-			}
-
 			fmt.Printf("%s MultiHash result: %s\n", singleHash, result)
 			out <- result
-			if inc(&totalMultiHashes); totalMultiHashes == workerCount {
-				close(out)
-			}
 		}(singleHash.(string))
 	}
+	wg.Wait()
 }
 
 func CombineResults(in, out chan interface{}) {
-	multiHashes := make([]string, 0)
+	idx := 0
+	multiHashes := make([]string, workerCount)
 	for multiHash := range in {
-		multiHashes = append(multiHashes, multiHash.(string))
+		multiHashes[idx] = multiHash.(string)
+		idx++
 	}
 	sort.Strings(multiHashes)
 
 	result := ""
-	for _, v := range multiHashes {
-		result += v + "_"
+	for _, multiHash := range multiHashes {
+		result += multiHash + "_"
 	}
-
-	result = result[:len(result) - 1]
+	result = result[:len(result)-1]
 	fmt.Printf("CombineResults: %s\n", result)
 	out <- result
-	close(out)
 }
 
-func ExecutePipeline(hashSignJobs... job){
+func ExecutePipeline(hashSignJobs ...job) {
 	in := make(chan interface{}, workerCount)
-	for _, job := range hashSignJobs {
+	wg := new(sync.WaitGroup)
+
+	for _, j := range hashSignJobs {
+		wg.Add(1)
 		out := make(chan interface{}, workerCount)
-		job(in, out)
+		go func(job job, in, out chan interface{}) {
+			defer wg.Done()
+			defer close(out)
+			job(in, out)
+		}(j, in, out)
 		in = out
 	}
+	wg.Wait()
 }
